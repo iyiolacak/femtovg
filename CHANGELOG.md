@@ -1,6 +1,13 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] (0.27.x backport)
+
+- WGPU: keep render pipelines across flushes that don't use them. Backport of
+  #366 (8d092f2) to 0.27: a flush that bound only some pipelines, such as a
+  lone clear, dropped the rest, so the next drawing flush rebuilt pipelines and
+  shaders. With the fix the cache evicts by age past its capacity instead.
+
 ## [0.27.0] - 2026-08-31
 
 - Added text decoration for `fill_text()` and `stroke_text()`: underline,

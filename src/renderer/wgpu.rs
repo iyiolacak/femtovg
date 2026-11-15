@@ -251,10 +251,91 @@ const SAMPLER_FLAGS: crate::ImageFlags = crate::ImageFlags::REPEAT_X
 
 type SamplerCache = Rc<RefCell<HashMap<crate::ImageFlags, wgpu::Sampler>>>;
 
+// Backport of femtovg #366 (8d092f2, "Keep WGPU pipelines across flushes that
+// don't use them") to 0.27: each flush dropped every cached pipeline it did not
+// use, so pipelines needed every few frames were compiled again each time.
+
+/// Pipelines kept between flushes. Above this, a flush evicts the least recently used. Large enough to keep the
+/// pipelines of views that are not being drawn.
+const PIPELINE_CACHE_CAPACITY: usize = 512;
+
+/// Flushes a pipeline stays protected after its last use, even above `PIPELINE_CACHE_CAPACITY`. A frame is several
+/// flushes when the app draws layers, so this keeps a whole frame's pipelines, and views that alternate within a
+/// few frames.
+const PIPELINE_RECENT_FLUSHES: u64 = 64;
+
 #[derive(Debug)]
 struct CachedPipeline {
     pipeline: wgpu::RenderPipeline,
+    /// Bound during the current flush (set by the command mapper).
     accessed: bool,
+    last_used: u64,
+}
+
+/// Evicts the entries whose `last_used` flush is oldest until at most `PIPELINE_CACHE_CAPACITY` remain, but none
+/// used within the last `PIPELINE_RECENT_FLUSHES` flushes: a frame that binds more states than that keeps them all.
+fn evict_least_recently_used<K: Clone + Eq + std::hash::Hash, V>(
+    cache: &mut HashMap<K, V>,
+    flush: u64,
+    last_used: impl Fn(&V) -> u64,
+) {
+    if cache.len() <= PIPELINE_CACHE_CAPACITY {
+        return;
+    }
+    let excess = cache.len() - PIPELINE_CACHE_CAPACITY;
+    let mut unused: Vec<(u64, K)> = cache
+        .iter()
+        .filter(|(_, value)| flush.saturating_sub(last_used(value)) > PIPELINE_RECENT_FLUSHES)
+        .map(|(key, value)| (last_used(value), key.clone()))
+        .collect();
+    unused.sort_unstable_by_key(|&(stamp, _)| stamp);
+    for (_, key) in unused.into_iter().take(excess) {
+        cache.remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_eviction_tests {
+    use super::{evict_least_recently_used, PIPELINE_CACHE_CAPACITY, PIPELINE_RECENT_FLUSHES};
+    use std::collections::HashMap;
+
+    /// Up to capacity a flush evicts nothing, one past it evicts the pipeline used longest ago, and a flush never
+    /// evicts a pipeline used within the last `PIPELINE_RECENT_FLUSHES` flushes.
+    #[test]
+    fn pipelines_are_evicted_only_past_capacity_least_recently_used_first() {
+        for len in PIPELINE_CACHE_CAPACITY - 1..=PIPELINE_CACHE_CAPACITY + 1 {
+            let flush = len as u64;
+            let mut cache: HashMap<usize, u64> = (0..len).map(|i| (i, i as u64)).collect();
+            cache.insert(0, flush);
+            evict_least_recently_used(&mut cache, flush, |&last_used| last_used);
+            assert_eq!(cache.len(), len.min(PIPELINE_CACHE_CAPACITY), "pipelines kept of {len}");
+            if len > PIPELINE_CACHE_CAPACITY {
+                assert!(!cache.contains_key(&1), "pipeline 1, used longest ago, was kept");
+            }
+        }
+
+        let len = PIPELINE_CACHE_CAPACITY + 1;
+        let mut cache: HashMap<usize, u64> = (0..len).map(|i| (i, 1)).collect();
+        evict_least_recently_used(&mut cache, 1, |&last_used| last_used);
+        assert_eq!(cache.len(), len, "a flush binding {len} states evicted some of them");
+
+        let flush = PIPELINE_RECENT_FLUSHES + 2;
+        let mut cache: HashMap<usize, u64> = (0..len).map(|i| (i, flush - 1)).collect();
+        cache.insert(1, flush - PIPELINE_RECENT_FLUSHES);
+        evict_least_recently_used(&mut cache, flush, |&last_used| last_used);
+        assert_eq!(
+            cache.len(),
+            len,
+            "pipeline 1, used {PIPELINE_RECENT_FLUSHES} flushes ago, was evicted"
+        );
+        cache.insert(1, flush - PIPELINE_RECENT_FLUSHES - 1);
+        evict_least_recently_used(&mut cache, flush, |&last_used| last_used);
+        assert!(
+            !cache.contains_key(&1),
+            "pipeline 1, used {} flushes ago, was kept",
+            PIPELINE_RECENT_FLUSHES + 1
+        );
+    }
 }
 
 /// WGPU renderer.
@@ -279,6 +360,7 @@ pub struct WGPURenderer {
     viewport_bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipeline_cache: Rc<RefCell<HashMap<PipelineState, CachedPipeline>>>,
+    flush_count: u64,
 }
 
 /// Rasterizes an image element into an offscreen canvas at the given size.
@@ -487,6 +569,7 @@ impl WGPURenderer {
             viewport_bind_group_layout,
             pipeline_layout,
             pipeline_cache: Default::default(),
+            flush_count: 0,
         }
     }
 }
@@ -715,9 +798,16 @@ impl Renderer for WGPURenderer {
 
         let command_buffer = encoder.finish();
 
-        self.pipeline_cache
-            .borrow_mut()
-            .retain(|_, cached_pipeline| std::mem::replace(&mut cached_pipeline.accessed, false));
+        self.flush_count += 1;
+        let flush = self.flush_count;
+        let mut pipeline_cache = self.pipeline_cache.borrow_mut();
+        for cached_pipeline in pipeline_cache.values_mut() {
+            if std::mem::replace(&mut cached_pipeline.accessed, false) {
+                cached_pipeline.last_used = flush;
+            }
+        }
+        evict_least_recently_used(&mut pipeline_cache, flush, |cached_pipeline| cached_pipeline.last_used);
+        drop(pipeline_cache);
 
         Some(command_buffer)
     }
@@ -2028,6 +2118,7 @@ impl CommandToPipelineAndBindGroupMapper {
                 CachedPipeline {
                     pipeline,
                     accessed: false,
+                    last_used: 0,
                 }
             });
             render_pipeline.accessed = true;
